@@ -5,6 +5,7 @@ import copy
 import os
 import io
 from aiohttp import web, ClientTimeout
+import base64
 import server
 from PIL import Image
 
@@ -15,6 +16,9 @@ from .network import handle_api_error, get_client_session
 
 # Configure maximum payload size (50MB default, configurable via environment variable)
 MAX_PAYLOAD_SIZE = int(os.environ.get('COMFYUI_MAX_PAYLOAD_SIZE', str(50 * 1024 * 1024)))
+
+# Import MAX_BATCH for final frame batching
+from .constants import MAX_BATCH
 
 # Import HEARTBEAT_TIMEOUT from constants
 from .constants import HEARTBEAT_TIMEOUT
@@ -605,6 +609,8 @@ def ensure_tile_jobs_initialized():
         debug_log("Initializing persistent tile job queue on server instance.")
         prompt_server.distributed_pending_tile_jobs = {}
         prompt_server.distributed_tile_jobs_lock = asyncio.Lock()
+        # Final frames storage
+        prompt_server.distributed_final_frames = {}
     else:
         # Clean up any legacy queue structures that don't have the 'mode' field
         # (Should be rare after fixes, but keep for safety)
@@ -613,7 +619,109 @@ def ensure_tile_jobs_initialized():
         for job_id in to_remove:
             debug_log(f"Removing legacy queue structure for job {job_id}")
             del prompt_server.distributed_pending_tile_jobs[job_id]
+        # Ensure final frames storage exists
+        if not hasattr(prompt_server, 'distributed_final_frames'):
+            prompt_server.distributed_final_frames = {}
     return prompt_server
+
+# Register final frames for distribution to workers
+async def register_final_frames(
+    multi_job_id: str,
+    frames: list,
+    enabled_workers: list,
+    expected_total: Optional[int] = None,
+    append: bool = True,
+    seal: Optional[bool] = None,
+):
+    """
+    Accumulate JPEG-encoded final frames for workers.
+
+    Notes:
+    - Frames must be bytes. This function APPENDS new chunks by default.
+    - Per-worker progress is preserved; new workers are initialized with 0.
+    - 'expected_total' can be provided to advertise the final count.
+    - If 'seal' is True, the set is marked as complete; if False, unsealed.
+      If 'seal' is None, we auto-seal when len(frames) >= expected_total.
+    """
+    prompt_server = ensure_tile_jobs_initialized()
+    async with prompt_server.distributed_tile_jobs_lock:
+        if not hasattr(prompt_server, 'distributed_final_frames'):
+            prompt_server.distributed_final_frames = {}
+
+        final_jobs = prompt_server.distributed_final_frames
+
+        # Normalize workers to strings
+        new_workers = [str(w) for w in (enabled_workers or [])]
+        add_count = len(frames) if frames else 0
+
+        job = final_jobs.get(multi_job_id)
+        if job is None:
+            # Create a new job entry
+            job = {
+                'frames': list(frames) if frames else [],
+                'progress': {w: 0 for w in new_workers},
+                'enabled_workers': new_workers,
+                'expected_total': int(expected_total) if expected_total is not None else None,
+                'sealed': bool(seal) if seal is not None else False,
+            }
+            final_jobs[multi_job_id] = job
+        else:
+            # Append or replace frames
+            if append:
+                if frames:
+                    job_frames = job.get('frames')
+                    if job_frames is None or not isinstance(job_frames, list):
+                        job['frames'] = []
+                        job_frames = job['frames']
+                    job_frames.extend(frames)
+            else:
+                job['frames'] = list(frames) if frames else []
+
+            # Merge workers without losing progress
+            if 'enabled_workers' not in job or not isinstance(job['enabled_workers'], list):
+                job['enabled_workers'] = []
+            for w in new_workers:
+                if w not in job['enabled_workers']:
+                    job['enabled_workers'].append(w)
+
+            prog = job.get('progress')
+            if prog is None or not isinstance(prog, dict):
+                prog = {}
+                job['progress'] = prog
+            for w in new_workers:
+                if w not in prog:
+                    prog[w] = 0
+
+            # Update expected_total if provided
+            if expected_total is not None:
+                try:
+                    job['expected_total'] = int(expected_total)
+                except Exception:
+                    pass
+
+            # Handle sealing state
+            if seal is True:
+                job['sealed'] = True
+            elif seal is False:
+                job['sealed'] = False
+            else:
+                # Auto-seal if we reached the advertised total
+                et = job.get('expected_total')
+                if et is not None and isinstance(et, int):
+                    if len(job.get('frames', [])) >= et:
+                        job['sealed'] = True
+                else:
+                    # Keep previous sealed state as-is when no total is known
+                    job.setdefault('sealed', False)
+
+        total_now = len(final_jobs[multi_job_id].get('frames', []))
+        workers_tracked = len(final_jobs[multi_job_id].get('progress', {}))
+        debug_log(
+            f"Registered +{add_count} finals (total={total_now}) for job {multi_job_id}; "
+            f"workers={workers_tracked}, sealed={final_jobs[multi_job_id].get('sealed', False)}, "
+            f"expected_total={final_jobs[multi_job_id].get('expected_total')}"
+        )
+
 
 # API Endpoint for tile completion
 @server.PromptServer.instance.routes.post("/distributed/request_image")
@@ -684,4 +792,174 @@ async def job_status_endpoint(request):
         ready = bool(job_data and isinstance(job_data, dict) and 'queue' in job_data)
         return web.json_response({"ready": ready})
 
+# Endpoint for workers to request final frames from master
+# Returns a batch of final frames encoded in base64 JPEG strings.
+# Enforces MAX_BATCH frames per response and MAX_PAYLOAD_SIZE limit.
+@server.PromptServer.instance.routes.post("/distributed/request_finals")
+async def request_finals_endpoint(request):
+    """Workers pull final frames. Honors MAX_BATCH/MAX_PAYLOAD_SIZE with base64
+    estimation and only returns is_last=True when the job is sealed and the
+    worker has consumed all produced frames."""
+    try:
+        data = await request.json()
+        multi_job_id = data.get('multi_job_id')
+        worker_id = str(data.get('worker_id', ''))
+        if not multi_job_id or not worker_id:
+            return await handle_api_error(request, "Missing multi_job_id or worker_id", 400)
 
+        prompt_server = ensure_tile_jobs_initialized()
+        async with prompt_server.distributed_tile_jobs_lock:
+            final_jobs = getattr(prompt_server, 'distributed_final_frames', None)
+            if not final_jobs or multi_job_id not in final_jobs:
+                return await handle_api_error(request, "Final frames not ready", 404)
+
+            job = final_jobs[multi_job_id]
+            frames = job.get('frames', []) or []
+            progress = job.get('progress', {}) or {}
+            expected_total = job.get('expected_total')
+            sealed = bool(job.get('sealed', False))
+
+            if worker_id not in progress:
+                progress[worker_id] = 0
+
+            start_idx = int(progress[worker_id])
+            total_frames = len(frames)
+
+            # Base64 size estimator (~4/3 expansion)
+            def _b64_size(n: int) -> int:
+                return ((int(n) + 2) // 3) * 4
+
+            max_json_bytes = int(MAX_PAYLOAD_SIZE) - (1024 * 1024)  # headroom
+            overhead_fixed = 256
+            overhead_per_item = 64
+
+            batch = []
+            used = 0
+            count = 0
+            i = start_idx
+            while i < total_frames and count < int(MAX_BATCH):
+                raw = frames[i]
+                est = _b64_size(len(raw)) + overhead_per_item
+                if batch and used + est + overhead_fixed > max_json_bytes:
+                    break
+                if not batch and est + overhead_fixed > max_json_bytes:
+                    # single huge item: still send alone
+                    batch.append(raw)
+                    used += est
+                    count += 1
+                    i += 1
+                    break
+                batch.append(raw)
+                used += est
+                count += 1
+                i += 1
+
+            progress[worker_id] = i
+
+            consumed_all = (i >= total_frames)
+            is_last = bool(sealed and consumed_all)
+
+            frames_b64 = [base64.b64encode(b).decode('ascii') for b in batch]
+            debug_log(
+                f"Sending {len(frames_b64)} final frames to worker {worker_id} "
+                f"(is_last={is_last}, sealed={sealed}, have={total_frames}, expected_total={expected_total})"
+            )
+            return web.json_response({"frames": frames_b64, "is_last": is_last})
+    except Exception as e:
+        return await handle_api_error(request, e, 500)
+async def dist_async_wait_for_final_frames(multi_job_id: str,
+                                           master_url: str,
+                                           worker_id: str,
+                                           dtype,
+                                           device):
+    """
+    Poll the master for final frames and assemble them.
+    Adds backoff when receiving empty batches with is_last=False to avoid busy loops.
+    """
+    final_frames = []
+    start_time = time.time()
+    batch_idx = 0
+    total_received = 0
+    total_decoded = 0
+    empty_batches = 0
+
+    while True:
+        # Heartbeat is best-effort
+        try:
+            await _send_heartbeat_to_master(multi_job_id, master_url, worker_id)
+        except Exception as _hb_err:
+            _vd_log(f"Heartbeat error (ignored): {type(_hb_err).__name__}: {_hb_err}")
+
+        try:
+            session = await get_client_session()
+            url = f"{master_url}/distributed/request_finals"
+            payload = {'multi_job_id': multi_job_id, 'worker_id': str(worker_id)}
+            async with session.post(url, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    frames_b64 = data.get('frames', []) or []
+                    is_last = bool(data.get('is_last', False))
+
+                    # Track inbound limits
+                    try:
+                        approx_payload = 256 + 64 * len(frames_b64) + sum(len(s or "") for s in frames_b64)
+                        eff_payload_limit = max(1 * 1024 * 1024, int(MAX_PAYLOAD_SIZE) - (1024 * 1024))
+                        if len(frames_b64) > int(MAX_BATCH) or approx_payload > eff_payload_limit:
+                            _vd_log(
+                                f"Notice: inbound finals batch #{batch_idx}: "
+                                f"count={len(frames_b64)} (limit {int(MAX_BATCH)}), "
+                                f"payload≈{approx_payload}B (limit {eff_payload_limit}B)."
+                            )
+                    except Exception:
+                        pass
+
+                    _vd_log(f"Batch {batch_idx}: received {len(frames_b64)} item(s), is_last={is_last}")
+                    total_received += len(frames_b64)
+
+                    if frames_b64:
+                        empty_batches = 0  # reset on progress
+                        # Parallel JPEG decode
+                        try:
+                            executor = get_jpeg_executor()
+                            arrs = list(executor.map(_decode_base64_to_np, frames_b64))
+                        except Exception:
+                            arrs = [_decode_base64_to_np(fb64) for fb64 in frames_b64]
+                        # To tensors
+                        for j, arr in enumerate(arrs):
+                            try:
+                                tensor = torch.from_numpy(arr).to(dtype=dtype).to(device)
+                                final_frames.append(tensor)
+                                total_decoded += 1
+                            except Exception as e:
+                                _vd_log(f"Decode failed at batch={batch_idx}, idx={j}: {type(e).__name__}: {e}")
+                    else:
+                        # No new frames; backoff to avoid tight loop
+                        empty_batches += 1
+                        await asyncio.sleep(min(1.0, 0.05 * empty_batches))
+
+                    if is_last:
+                        _vd_log(f"Completed: batches={batch_idx+1}, received={total_received}, decoded={total_decoded}")
+                        break
+
+                elif resp.status == 404:
+                    _vd_log("Master not ready (404), retrying…")
+                    await asyncio.sleep(1.0)
+                else:
+                    _vd_log(f"Unexpected status={resp.status}, retrying…")
+                    await asyncio.sleep(1.0)
+
+            batch_idx += 1
+
+        except Exception as req_err:
+            _vd_log(f"Request error, retrying: {type(req_err).__name__}: {req_err}")
+            await asyncio.sleep(1.0)
+
+        if time.time() - start_time > 900:
+            raise RuntimeError("Timeout waiting for final frames from master")
+
+    if final_frames:
+        out = torch.stack(final_frames, dim=0).contiguous()
+    else:
+        out = torch.empty((0,), dtype=dtype, device=device)
+
+    return out
