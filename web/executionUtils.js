@@ -59,7 +59,10 @@ export function setupInterceptor(extension) {
     api.queuePrompt = async (number, prompt) => {
         if (extension.isEnabled) {
             const hasCollector = findNodesByClass(prompt.output, "DistributedCollector").length > 0;
-            const hasDistUpscale = findNodesByClass(prompt.output, "UltimateSDUpscaleDistributed").length > 0;
+            const hasDistUpscale =
+                findNodesByClass(prompt.output, "UltimateSDUpscaleDistributed").length > 0 ||
+                findNodesByClass(prompt.output, "UltimateSDVideoUpscaleDistributed").length > 0 ||
+                findNodesByClass(prompt.output, "UpscaleWithModelBatchedTiled").length > 0; 
             
             if (hasCollector || hasDistUpscale) {
                 const result = await executeParallelDistributed(extension, prompt);
@@ -130,7 +133,9 @@ export async function executeParallelDistributed(extension, promptWrapper) {
         // Find all distributed nodes in the workflow
         const collectorNodes = findNodesByClass(promptWrapper.output, "DistributedCollector");
         const upscaleNodes = findNodesByClass(promptWrapper.output, "UltimateSDUpscaleDistributed");
-        const allDistributedNodes = [...collectorNodes, ...upscaleNodes];
+        const videoUpscaleNodes = findNodesByClass(promptWrapper.output, "UltimateSDVideoUpscaleDistributed");
+        const tiledUpscaleNodes = findNodesByClass(promptWrapper.output, "UpscaleWithModelBatchedTiled");
+        const allDistributedNodes = [...collectorNodes, ...upscaleNodes, ...videoUpscaleNodes, ...tiledUpscaleNodes];
         
         // Map original node IDs to truly unique job IDs for this specific run
         const job_id_map = new Map(allDistributedNodes.map(node => [node.id, `${executionPrefix}_${node.id}`]));
@@ -191,7 +196,9 @@ export async function prepareApiPromptForParticipant(extension, baseApiPrompt, p
     // Find all distributed nodes once (before pruning)
     const collectorNodes = findNodesByClass(jobApiPrompt, "DistributedCollector");
     const upscaleNodes = findNodesByClass(jobApiPrompt, "UltimateSDUpscaleDistributed");
-    const allDistributedNodes = [...collectorNodes, ...upscaleNodes];
+    const videoUpscaleNodes = findNodesByClass(jobApiPrompt, "UltimateSDVideoUpscaleDistributed");
+    const tiledUpscaleNodes = findNodesByClass(jobApiPrompt, "UpscaleWithModelBatchedTiled");
+    const allDistributedNodes = [...collectorNodes, ...upscaleNodes, ...videoUpscaleNodes, ...tiledUpscaleNodes];
     
     // For workers, handle platform-specific path conversion
     if (!isMaster) {
@@ -262,11 +269,10 @@ export async function prepareApiPromptForParticipant(extension, baseApiPrompt, p
         const { inputs } = jobApiPrompt[collector.id];
         
         // Check if this collector is downstream from a distributed upscaler
-        const hasUpstreamDistributedUpscaler = hasUpstreamNode(
-            jobApiPrompt, 
-            collector.id, 
-            'UltimateSDUpscaleDistributed'
-        );
+        const hasUpstreamDistributedUpscaler =
+            hasUpstreamNode(jobApiPrompt, collector.id, 'UltimateSDUpscaleDistributed') ||
+            hasUpstreamNode(jobApiPrompt, collector.id, 'UltimateSDVideoUpscaleDistributed') ||
+            hasUpstreamNode(jobApiPrompt, collector.id, 'UpscaleWithModelBatchedTiled');
         
         if (hasUpstreamDistributedUpscaler) {
             // Set pass_through mode for this collector
@@ -291,25 +297,21 @@ export async function prepareApiPromptForParticipant(extension, baseApiPrompt, p
         }
     }
     
-    // Handle Ultimate SD Upscale Distributed nodes
-    for (const upscaleNode of upscaleNodes) {
-        const { inputs } = jobApiPrompt[upscaleNode.id];
-        
-        // Get the unique job ID from the map
-        const uniqueJobId = options.job_id_map ? options.job_id_map.get(upscaleNode.id) : upscaleNode.id;
-        
-        inputs.multi_job_id = uniqueJobId;
-        inputs.is_worker = !isMaster;
-        
-        if (isMaster) {
-            inputs.enabled_worker_ids = JSON.stringify(options.enabled_worker_ids || []);
-        } else {
-            inputs.master_url = extension.getMasterUrl();
-            inputs.worker_id = participantId;
-            // Workers also need the enabled_worker_ids to calculate tile distribution
-            inputs.enabled_worker_ids = JSON.stringify(options.enabled_worker_ids || []);
-        }
-    }
+    // Handle both Upscale nodes (image + video wrapper)
+    const upscaleLikeNodes = [...upscaleNodes, ...videoUpscaleNodes, ...tiledUpscaleNodes];
+    for (const upscaleNode of upscaleLikeNodes) {
+         const { inputs } = jobApiPrompt[upscaleNode.id];
+         const uniqueJobId = options.job_id_map ? options.job_id_map.get(upscaleNode.id) : upscaleNode.id;
+         inputs.multi_job_id = uniqueJobId;
+         inputs.is_worker = !isMaster;
+         if (isMaster) {
+             inputs.enabled_worker_ids = JSON.stringify(options.enabled_worker_ids || []);
+         } else {
+             inputs.master_url = extension.getMasterUrl();
+             inputs.worker_id = participantId;
+             inputs.enabled_worker_ids = JSON.stringify(options.enabled_worker_ids || []);
+         }
+     }
     
     return jobApiPrompt;
 }

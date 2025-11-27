@@ -92,10 +92,13 @@ export function findImageReferences(extension, apiPrompt) {
     const imageExtensions = /\.(png|jpg|jpeg|gif|webp|bmp|mp4|avi|mov|mkv|webm)(\s*\[\w+\])?$/i;
     
     for (const [nodeId, node] of Object.entries(apiPrompt)) {
-        // Check for both 'image' and 'video' inputs
+        // Check for 'image', 'images' and 'video' inputs
         const mediaInputs = [];
         if (node.inputs && node.inputs.image) {
             mediaInputs.push(node.inputs.image);
+        }
+        if (node.inputs && node.inputs.images) {
+            mediaInputs.push(node.inputs.images);
         }
         if (node.inputs && node.inputs.video) {
             mediaInputs.push(node.inputs.video);
@@ -111,7 +114,7 @@ export function findImageReferences(extension, apiPrompt) {
                     images.set(normalizedValue, {
                         nodeId,
                         nodeType: node.class_type,
-                        inputName: 'image'  // Keep as 'image' for compatibility
+                        inputName: 'image'  // keep as 'image' for compatibility
                     });
                     extension.log(`Found media reference: ${normalizedValue} in node ${nodeId} (${node.class_type})`, "debug");
                 }
@@ -166,7 +169,9 @@ export function pruneWorkflowForWorker(extension, apiPrompt, distributedNodes = 
     if (!distributedNodes) {
         const collectorNodes = findNodesByClass(apiPrompt, "DistributedCollector");
         const upscaleNodes = findNodesByClass(apiPrompt, "UltimateSDUpscaleDistributed");
-        distributedNodes = [...collectorNodes, ...upscaleNodes];
+        const videoUpscaleNodes = findNodesByClass(apiPrompt, "UltimateSDVideoUpscaleDistributed");
+        const tiledUpscaleNodes = findNodesByClass(apiPrompt, "UpscaleWithModelBatchedTiled");
+        distributedNodes = [...collectorNodes, ...upscaleNodes, ...videoUpscaleNodes, ...tiledUpscaleNodes];
     }
     
     if (distributedNodes.length === 0) {
